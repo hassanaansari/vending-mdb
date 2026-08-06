@@ -2,12 +2,15 @@ const express = require("express");
 const app = express();
 const server = require("http").createServer(app);
 const io = require("socket.io")(server);
+const path = require("path");
 const port = process.env.PORT || 3000;
 
 const { SerialPort } = require("serialport");
 require("dotenv").config();
 
 const { asciiToString } = require("./src/utils/functions");
+
+app.use(express.static(path.join(__dirname, "public")));
 
 // ============================================================
 // Configuration
@@ -24,6 +27,7 @@ const serialPort = new SerialPort({
 });
 
 let pythonSocket = null;
+let vmcSimulatorSocket = null;
 
 // ============================================================
 // Machine State
@@ -95,196 +99,14 @@ const checksum = (array) => {
 };
 
 // ============================================================
-// Server
+// Dummy Test Socket function in place of vending machine
 // ============================================================
-
-server.listen(port, () => {
-  log(`NodeJS server listening on port ${port}`);
-});
-
-// ============================================================
-// Serial Port Events
-// ============================================================
-
-serialPort.on("open", () => {
-  log(`VMC serial port opened: ${serialPort.path}`);
-});
-
-serialPort.on("error", (error) => {
-  log("VMC SERIAL ERROR", error.message);
-});
-
-serialPort.on("close", () => {
-  log("VMC SERIAL PORT CLOSED");
-});
-
-// ============================================================
-// Initial VMC Configuration
-// ============================================================
-
-setTimeout(() => {
-  // Reset
-  const result = checksum([0x00]);
-
-  writeMdb(result, "VMC RESET");
-
-  setTimeout(() => {
-    // Configuration Data
-    const configResult = checksum([
-      0x01, 0x03, 0x15, 0x86, 0x01, 0x00, 0x05, 0x0c,
-    ]);
-
-    writeMdb(configResult, "VMC CONFIGURATION");
-  }, 5000);
-}, 8000);
-
-// ============================================================
-// Socket.IO - Python Communication
-// ============================================================
-
-io.on("connection", (socket) => {
-  pythonSocket = socket;
-
-  log(`Python connected through Socket.IO: ${socket.id}`);
-
-  // ----------------------------------------------------------
-  // Purchase / Start Cashless Transaction
-  // ----------------------------------------------------------
-
-  socket.on("purchase now", () => {
-    log("PYTHON -> VMC: Purchase requested");
-
-    setVmcStatus("connect");
-
-    const result = checksum([0x03, 0x03, 0xe8]);
-
-    writeMdb(result, "VMC PURCHASE REQUEST");
-  });
-
-  // ----------------------------------------------------------
-  // Approve Vend
-  // ----------------------------------------------------------
-
-  socket.on("approve vend", () => {
-    log("PYTHON -> VMC: Approve vend");
-
-    setVmcStatus("approved");
-
-    const hexVar1 = parseInt("0x" + productPriceHex.substring(0, 2));
-
-    const hexVar2 = parseInt("0x" + productPriceHex.substring(2, 4));
-
-    productPriceHex = "";
-
-    const approveArray = [0x05];
-
-    approveArray.push(hexVar1);
-    approveArray.push(hexVar2);
-
-    const result = checksum(approveArray);
-
-    writeMdb(result, "VMC APPROVE VEND");
-  });
-
-  // ----------------------------------------------------------
-  // Reject Vend
-  // ----------------------------------------------------------
-
-  socket.on("reject vend", () => {
-    log("PYTHON -> VMC: Reject vend");
-
-    setVmcStatus("rejected");
-
-    const result = checksum([0x06]);
-
-    writeMdb(result, "VMC REJECT VEND");
-  });
-
-  // ----------------------------------------------------------
-  // Cancel Vend
-  // ----------------------------------------------------------
-
-  socket.on("cancel vend", () => {
-    log("PYTHON -> VMC: Cancel vend");
-
-    setVmcStatus("cancel");
-
-    const result = checksum([0x04]);
-
-    writeMdb(result, "VMC CANCEL VEND");
-  });
-
-  // ----------------------------------------------------------
-  // Enable Cash / Disable Cashless
-  // ----------------------------------------------------------
-
-  socket.on("cash on", () => {
-    log("PYTHON -> VMC: Cash mode requested");
-
-    setVmcStatus("enable");
-
-    const result = checksum([0x06]);
-
-    writeMdb(result, "VMC CASH MODE STEP 1");
-
-    setTimeout(() => {
-      const result = checksum([0x07]);
-
-      writeMdb(result, "VMC CASH MODE STEP 2");
-
-      setTimeout(() => {
-        const result = checksum([0x06]);
-
-        writeMdb(result, "VMC CASH MODE STEP 3");
-
-        setTimeout(() => {
-          const result = checksum([0x07]);
-
-          writeMdb(result, "VMC CASH MODE STEP 4");
-
-          log("VMC cash mode sequence completed");
-        }, 1000);
-      }, 1000);
-    }, 1000);
-  });
-
-  // ----------------------------------------------------------
-  // Disconnect
-  // ----------------------------------------------------------
-
-  socket.on("disconnect", () => {
-    if (pythonSocket?.id === socket.id) {
-      pythonSocket = null;
-    }
-
-    log(`Python disconnected: ${socket.id}`);
-  });
-});
-
-// ============================================================
-// Read Data From Vending Machine
-// ============================================================
-
-serialPort.on("readable", async () => {
-  let vmcObj = await serialPort.read();
-
-  if (vmcObj == null) {
-    return;
-  }
-
-  const rawHex = vmcObj.toString("hex");
-  const vmcChar = asciiToString(rawHex).trim();
-
-  // Ignore empty responses
-  if (!vmcChar) {
-    return;
-  }
-
+const processVmcData = async (vmcChar, rawHex = null) => {
   // We don't need noisy logging for simple 00 responses.
   // Log meaningful MDB responses only.
   if (vmcChar !== "00") {
     log("VMC RX", {
-      hex: rawHex.toUpperCase(),
+      hex: rawHex?.toUpperCase(),
       data: vmcChar,
       status: vmcStatus,
     });
@@ -655,4 +477,246 @@ serialPort.on("readable", async () => {
       setVmcStatus("cashSale");
     }
   }
+};
+
+// ============================================================
+// Server
+// ============================================================
+
+server.listen(port, () => {
+  log(`NodeJS server listening on port ${port}`);
+});
+
+// ============================================================
+// Serial Port Events
+// ============================================================
+
+serialPort.on("open", () => {
+  log(`VMC serial port opened: ${serialPort.path}`);
+});
+
+serialPort.on("error", (error) => {
+  log("VMC SERIAL ERROR", error.message);
+});
+
+serialPort.on("close", () => {
+  log("VMC SERIAL PORT CLOSED");
+});
+
+// ============================================================
+// Initial VMC Configuration
+// ============================================================
+
+setTimeout(() => {
+  // Reset
+  const result = checksum([0x00]);
+
+  writeMdb(result, "VMC RESET");
+
+  setTimeout(() => {
+    // Configuration Data
+    const configResult = checksum([
+      0x01, 0x03, 0x15, 0x86, 0x01, 0x00, 0x05, 0x0c,
+    ]);
+
+    writeMdb(configResult, "VMC CONFIGURATION");
+  }, 5000);
+}, 8000);
+
+// ============================================================
+// Socket.IO - Python Communication
+// ============================================================
+
+io.on("connection", (socket) => {
+  log(`Socket connected: ${socket.id}`);
+
+  // ----------------------------------------------------------
+  // Python POS Registration
+  // ----------------------------------------------------------
+
+  socket.on("register:python", () => {
+    pythonSocket = socket;
+
+    log(`[PYTHON] Python POS registered: ${socket.id}`);
+  });
+
+  // ----------------------------------------------------------
+  // Simulator Registration
+  // ----------------------------------------------------------
+
+  socket.on("register:vmc-simulator", () => {
+    vmcSimulatorSocket = socket;
+
+    // This socket is the simulator, not Python
+    if (pythonSocket?.id === socket.id) {
+      pythonSocket = null;
+    }
+
+    log(`[SIM] VMC Simulator registered: ${socket.id}`);
+  });
+
+  // ----------------------------------------------------------
+  // Purchase / Start Cashless Transaction
+  // ----------------------------------------------------------
+
+  socket.on("purchase now", () => {
+    log("PYTHON -> VMC: Purchase requested");
+
+    setVmcStatus("connect");
+
+    const result = checksum([0x03, 0x03, 0xe8]);
+
+    writeMdb(result, "VMC PURCHASE REQUEST");
+  });
+
+  // ----------------------------------------------------------
+  // Approve Vend
+  // ----------------------------------------------------------
+
+  socket.on("approve vend", () => {
+    log("PYTHON -> VMC: Approve vend");
+
+    setVmcStatus("approved");
+
+    const hexVar1 = parseInt("0x" + productPriceHex.substring(0, 2));
+
+    const hexVar2 = parseInt("0x" + productPriceHex.substring(2, 4));
+
+    productPriceHex = "";
+
+    const approveArray = [0x05];
+
+    approveArray.push(hexVar1);
+    approveArray.push(hexVar2);
+
+    const result = checksum(approveArray);
+
+    writeMdb(result, "VMC APPROVE VEND");
+  });
+
+  // ----------------------------------------------------------
+  // Reject Vend
+  // ----------------------------------------------------------
+
+  socket.on("reject vend", () => {
+    log("PYTHON -> VMC: Reject vend");
+
+    setVmcStatus("rejected");
+
+    const result = checksum([0x06]);
+
+    writeMdb(result, "VMC REJECT VEND");
+  });
+
+  // ----------------------------------------------------------
+  // Cancel Vend
+  // ----------------------------------------------------------
+
+  socket.on("cancel vend", () => {
+    log("PYTHON -> VMC: Cancel vend");
+
+    setVmcStatus("cancel");
+
+    const result = checksum([0x04]);
+
+    writeMdb(result, "VMC CANCEL VEND");
+  });
+
+  // ----------------------------------------------------------
+  // Enable Cash / Disable Cashless
+  // ----------------------------------------------------------
+
+  socket.on("cash on", () => {
+    log("PYTHON -> VMC: Cash mode requested");
+
+    setVmcStatus("enable");
+
+    const result = checksum([0x06]);
+
+    writeMdb(result, "VMC CASH MODE STEP 1");
+
+    setTimeout(() => {
+      const result = checksum([0x07]);
+
+      writeMdb(result, "VMC CASH MODE STEP 2");
+
+      setTimeout(() => {
+        const result = checksum([0x06]);
+
+        writeMdb(result, "VMC CASH MODE STEP 3");
+
+        setTimeout(() => {
+          const result = checksum([0x07]);
+
+          writeMdb(result, "VMC CASH MODE STEP 4");
+
+          log("VMC cash mode sequence completed");
+        }, 1000);
+      }, 1000);
+    }, 1000);
+  });
+
+  // ----------------------------------------------------------
+  // Payment Result
+  // ----------------------------------------------------------
+  socket.on("pos payment result", (result) => {
+    console.log("[POS] Payment result received:", result);
+
+    if (result?.status === "approved") {
+      console.log("[POS] Payment approved.");
+    } else {
+      console.log("[POS] Payment not approved:", result?.response);
+    }
+  });
+
+  // ----------------------------------------------------------
+  // Simulation Socket in place of vending machine
+  // ----------------------------------------------------------
+  socket.on("vmc raw", async (vmcChar) => {
+    console.log(`[SIMULATOR] RX: ${vmcChar}`);
+
+    await processVmcData(vmcChar);
+  });
+
+  // ----------------------------------------------------------
+  // Disconnect
+  // ----------------------------------------------------------
+
+  socket.on("disconnect", () => {
+    if (vmcSimulatorSocket?.id === socket.id) {
+      vmcSimulatorSocket = null;
+
+      log(`[SIM] VMC Simulator disconnected: ${socket.id}`);
+
+      return;
+    }
+
+    if (pythonSocket?.id === socket.id) {
+      pythonSocket = null;
+
+      log(`[PYTHON] Python POS disconnected: ${socket.id}`);
+    }
+  });
+});
+
+// ============================================================
+// Read Data From Vending Machine
+// ============================================================
+
+serialPort.on("readable", async () => {
+  let vmcObj = await serialPort.read();
+
+  if (vmcObj == null) {
+    return;
+  }
+
+  const rawHex = vmcObj.toString("hex");
+  const vmcChar = asciiToString(rawHex).trim();
+
+  // Ignore empty responses
+  if (!vmcChar) {
+    return;
+  }
+
+  await processVmcData(vmcChar, rawHex);
 });

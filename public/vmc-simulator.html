@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <title>VMC Simulator</title>
+
+    <script src="/socket.io/socket.io.js"></script>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 900px;
+            margin: 30px auto;
+            padding: 20px;
+        }
+
+        h1 {
+            margin-bottom: 5px;
+        }
+
+        .status {
+            padding: 12px;
+            background: #eee;
+            margin-bottom: 20px;
+            border-radius: 6px;
+        }
+
+        .section {
+            margin-bottom: 25px;
+        }
+
+        button {
+            padding: 12px 18px;
+            margin: 5px;
+            cursor: pointer;
+        }
+
+        .log {
+            background: #111;
+            color: #eee;
+            padding: 15px;
+            height: 350px;
+            overflow-y: auto;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+
+        input {
+            padding: 10px;
+            width: 100px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>Vending Machine Simulator</h1>
+
+    <div class="status">
+        Socket:
+        <strong id="connectionStatus">Connecting...</strong>
+    </div>
+
+    <div class="section">
+        <h2>Transaction</h2>
+
+        <button onclick="purchaseNow()">
+            Purchase Now
+        </button>
+
+        <button onclick="approveVend()">
+            Approve Vend
+        </button>
+
+        <button onclick="rejectVend()">
+            Reject Vend
+        </button>
+
+        <button onclick="cancelVend()">
+            Cancel Vend
+        </button>
+
+        <button onclick="cashOn()">
+            Cash On
+        </button>
+    </div>
+
+    <div class="section">
+        <h2>Machine Responses</h2>
+
+        <button onclick="send('00')">
+            Machine Ready (00)
+        </button>
+
+        <button onclick="sendProduct()">
+            Product Selected
+        </button>
+
+        <button onclick="send('1302')">
+            Vend Complete (1302)
+        </button>
+
+        <button onclick="send('1303')">
+            Cash Vend (1303)
+        </button>
+
+        <button onclick="sendCashSale()">
+            Cash Sale (1305)
+        </button>
+
+        <button onclick="send('1304')">
+            Session End (1304)
+        </button>
+    </div>
+
+    <div class="section">
+        <h2>Custom MDB Response</h2>
+
+        <input id="customResponse" placeholder="1300..." />
+
+        <button onclick="sendCustom()">
+            Send
+        </button>
+    </div>
+
+    <div class="section">
+        <h2>Logs</h2>
+
+        <button onclick="clearLogs()">
+            Clear Logs
+        </button>
+
+        <div id="logs" class="log"></div>
+    </div>
+
+    <script>
+        const socket = io();
+
+        const connectionStatus =
+            document.getElementById("connectionStatus");
+
+        const logs =
+            document.getElementById("logs");
+
+        socket.on("connect", () => {
+            connectionStatus.textContent = "Connected";
+            log(`Connected: ${socket.id}`);
+            socket.emit("register:vmc-simulator");
+        });
+
+        socket.on("disconnect", () => {
+            connectionStatus.textContent = "Disconnected";
+            log("Socket disconnected");
+        });
+
+        socket.on("product price", (data) => {
+            log(`NodeJS -> Simulator: product price ${JSON.stringify(data)}`);
+        });
+
+        socket.on("cash sale", (data) => {
+            log(`NodeJS -> Simulator: cash sale ${JSON.stringify(data)}`);
+        });
+
+        function log(message) {
+            const timestamp =
+                new Date().toLocaleTimeString();
+
+            logs.textContent +=
+                `[${timestamp}] ${message}\n`;
+
+            logs.scrollTop = logs.scrollHeight;
+        }
+
+        function send(vmcData) {
+            log(`Simulator -> NodeJS: ${vmcData}`);
+
+            socket.emit("vmc raw", vmcData);
+        }
+
+        function purchaseNow() {
+            log("Simulator -> NodeJS: purchase now");
+
+            socket.emit("purchase now");
+        }
+
+        function approveVend() {
+            log("Simulator -> NodeJS: approve vend");
+
+            socket.emit("approve vend");
+        }
+
+        function rejectVend() {
+            log("Simulator -> NodeJS: reject vend");
+
+            socket.emit("reject vend");
+        }
+
+        function cancelVend() {
+            log("Simulator -> NodeJS: cancel vend");
+
+            socket.emit("cancel vend");
+        }
+
+        function cashOn() {
+            log("Simulator -> NodeJS: cash on");
+
+            socket.emit("cash on");
+        }
+
+        function sendProduct() {
+            /*
+              1300
+              0064 = price 5
+              0003 = product ID 3
+            */
+
+            send("130000050003");
+        }
+
+        function sendCashSale() {
+            /*
+              1305
+              0000 = reserved
+              0064 = price 100
+              0003 = product ID 3
+            */
+
+            send("1305000000640003");
+        }
+
+        function sendCustom() {
+            const value =
+                document
+                    .getElementById("customResponse")
+                    .value
+                    .trim();
+
+            if (!value) {
+                return;
+            }
+
+            send(value);
+        }
+
+        function clearLogs() {
+            logs.textContent = "";
+        }
+    </script>
+
+</body>
+
+</html>
