@@ -18,10 +18,10 @@ app.use(express.static(path.join(__dirname, "public")));
 
 const serialPort = new SerialPort({
   // Windows
-  path: "COM3",
+  // path: "COM3",
 
   // Raspberry Pi example:
-  // path: "/dev/ttyAMA0",
+  path: "/dev/ttyAMA0",
 
   baudRate: 9600,
 });
