@@ -82,6 +82,17 @@ const writeMdb = (buffer, description = "MDB command") => {
   });
 };
 
+const emitVendResult = (status, code) => {
+  log(`VMC VEND RESULT: ${status} code=${code}`);
+
+  if (pythonSocket) {
+    pythonSocket.emit("vend result", { status, code });
+    log(`VMC -> PYTHON: vend result`, { status, code });
+  } else {
+    log("VEND RESULT: Python is not connected");
+  }
+};
+
 // ============================================================
 // Checksum
 // ============================================================
@@ -229,6 +240,8 @@ const processVmcData = async (vmcChar, rawHex = null) => {
 
       setVmcStatus("complete");
 
+      emitVendResult("success", "1302");
+
       priceCheck = false;
       dropSensor = false;
       productPrice = "0";
@@ -238,6 +251,8 @@ const processVmcData = async (vmcChar, rawHex = null) => {
       writeMdb(result, "VMC CASH VEND ACK");
 
       setVmcStatus("cash");
+
+      emitVendResult("not_dispensed", "1303");
 
       priceCheck = false;
       dropSensor = false;
@@ -367,11 +382,15 @@ const processVmcData = async (vmcChar, rawHex = null) => {
         if (startByte === "1302") {
           setVmcStatus("complete");
 
+          emitVendResult("success", "1302");
+
           priceCheck = false;
           dropSensor = false;
           productPrice = "0";
         } else if (startByte === "1303") {
           setVmcStatus("cash");
+
+          emitVendResult("not_dispensed", "1303");
 
           priceCheck = false;
           dropSensor = false;
@@ -561,6 +580,25 @@ io.on("connection", (socket) => {
 
   socket.on("purchase now", () => {
     log("PYTHON -> VMC: Purchase requested");
+
+    setVmcStatus("connect");
+
+    const result = checksum([0x03, 0x03, 0xe8]);
+
+    writeMdb(result, "VMC PURCHASE REQUEST");
+  });
+
+  // ----------------------------------------------------------
+  // Start Purchase (guarded, Python-facing)
+  // ----------------------------------------------------------
+
+  socket.on("start purchase", () => {
+    if (vmcStatus !== "" && vmcStatus !== "enable") {
+      log(`PURCHASE BLOCKED: vmcStatus="${vmcStatus}"`);
+      return;
+    }
+
+    log("PYTHON -> VMC: Purchase requested (guarded)");
 
     setVmcStatus("connect");
 
