@@ -48,6 +48,16 @@ let vmcCashString = "";
 let dropSensorString = "";
 let processEndString = "";
 
+// ============================================================
+// Status Timeout Monitoring
+// ============================================================
+
+let idleTimeoutTimer = null;
+let rejectedTimeoutTimer = null;
+
+const IDLE_TIMEOUT_MS = 15000; // 15 seconds
+const REJECTED_TIMEOUT_MS = 5000; // 5 seconds
+
 let vmcTest;
 
 // ============================================================
@@ -64,12 +74,88 @@ const log = (message, data = null) => {
   }
 };
 
+const runCashOnReset = () => {
+  log("AUTO RESET: Running cash on sequence (machine stuck recovery)");
+
+  setVmcStatus("enable");
+
+  const result = checksum([0x06]);
+  writeMdb(result, "VMC CASH MODE STEP 1");
+
+  setTimeout(() => {
+    const result2 = checksum([0x07]);
+    writeMdb(result2, "VMC CASH MODE STEP 2");
+
+    setTimeout(() => {
+      const result3 = checksum([0x06]);
+      writeMdb(result3, "VMC CASH MODE STEP 3");
+
+      setTimeout(() => {
+        const result4 = checksum([0x07]);
+        writeMdb(result4, "VMC CASH MODE STEP 4");
+        log("AUTO RESET: Cash mode sequence completed");
+      }, 1000);
+    }, 1000);
+  }, 1000);
+};
+
 const setVmcStatus = (status) => {
   if (vmcStatus !== status) {
     log(`VMC STATUS: ${vmcStatus || "INITIAL"} -> ${status}`);
   }
 
+  // Clear any running timeout timers when leaving monitored states
+  if (vmcStatus === "idle" && status !== "idle") {
+    if (idleTimeoutTimer) {
+      clearTimeout(idleTimeoutTimer);
+      idleTimeoutTimer = null;
+      log("IDLE TIMER: Cleared (status changed from idle)");
+    }
+  }
+
+  if (vmcStatus === "rejected" && status !== "rejected") {
+    if (rejectedTimeoutTimer) {
+      clearTimeout(rejectedTimeoutTimer);
+      rejectedTimeoutTimer = null;
+      log("REJECTED TIMER: Cleared (status changed from rejected)");
+    }
+  }
+
   vmcStatus = status;
+
+  // Start idle timeout when entering idle status
+  if (status === "idle" && !idleTimeoutTimer) {
+    log(`IDLE TIMER: Starting ${IDLE_TIMEOUT_MS / 1000}s timeout`);
+    idleTimeoutTimer = setTimeout(() => {
+      if (vmcStatus === "idle") {
+        log("IDLE TIMEOUT: Machine stuck in idle for 15s, resetting to enable");
+        idleTimeoutTimer = null;
+        priceCheck = false;
+        dropSensor = false;
+        processEnd = false;
+        cashSaleCheck = false;
+        vmcPriceString = "";
+        vmcCashString = "";
+        dropSensorString = "";
+        processEndString = "";
+        runCashOnReset();
+      }
+    }, IDLE_TIMEOUT_MS);
+  }
+
+  // Start rejected timeout when entering rejected status
+  if (status === "rejected" && !rejectedTimeoutTimer) {
+    log(`REJECTED TIMER: Starting ${REJECTED_TIMEOUT_MS / 1000}s timeout`);
+    rejectedTimeoutTimer = setTimeout(() => {
+      if (vmcStatus === "rejected") {
+        log(
+          "REJECTED TIMEOUT: Machine stuck in rejected for 5s, running cash on reset",
+        );
+        rejectedTimeoutTimer = null;
+        runCashOnReset();
+      }
+    }, REJECTED_TIMEOUT_MS);
+  }
 };
 
 const writeMdb = (buffer, description = "MDB command") => {
@@ -666,32 +752,7 @@ io.on("connection", (socket) => {
 
   socket.on("cash on", () => {
     log("PYTHON -> VMC: Cash mode requested");
-
-    setVmcStatus("enable");
-
-    const result = checksum([0x06]);
-
-    writeMdb(result, "VMC CASH MODE STEP 1");
-
-    setTimeout(() => {
-      const result = checksum([0x07]);
-
-      writeMdb(result, "VMC CASH MODE STEP 2");
-
-      setTimeout(() => {
-        const result = checksum([0x06]);
-
-        writeMdb(result, "VMC CASH MODE STEP 3");
-
-        setTimeout(() => {
-          const result = checksum([0x07]);
-
-          writeMdb(result, "VMC CASH MODE STEP 4");
-
-          log("VMC cash mode sequence completed");
-        }, 1000);
-      }, 1000);
-    }, 1000);
+    runCashOnReset();
   });
 
   // ----------------------------------------------------------
