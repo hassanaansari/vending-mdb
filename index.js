@@ -10,6 +10,8 @@ require("dotenv").config();
 
 const { asciiToString } = require("./src/utils/functions");
 
+const autoPurchaseEnabled = process.env.AUTO_PURCHASE === "true";
+
 app.use(express.static(path.join(__dirname, "public")));
 
 // ============================================================
@@ -54,9 +56,11 @@ let processEndString = "";
 
 let idleTimeoutTimer = null;
 let rejectedTimeoutTimer = null;
+let autoPurchaseTimer = null;
 
 const IDLE_TIMEOUT_MS = 15000; // 15 seconds
 const REJECTED_TIMEOUT_MS = 5000; // 5 seconds
+const AUTO_PURCHASE_DELAY_MS = 4000; // 2 seconds delay before auto-purchase
 
 let vmcTest;
 
@@ -99,6 +103,20 @@ const runCashOnReset = () => {
   }, 1000);
 };
 
+const triggerAutoPurchase = () => {
+  if (vmcStatus !== "" && vmcStatus !== "enable") {
+    log(`AUTO PURCHASE: Skipped (vmcStatus="${vmcStatus}")`);
+    return;
+  }
+
+  log("AUTO PURCHASE: Triggering purchase request");
+
+  setVmcStatus("connect");
+
+  const result = checksum([0x03, 0x03, 0xe8]);
+  writeMdb(result, "VMC AUTO PURCHASE REQUEST");
+};
+
 const setVmcStatus = (status) => {
   if (vmcStatus !== status) {
     log(`VMC STATUS: ${vmcStatus || "INITIAL"} -> ${status}`);
@@ -118,6 +136,19 @@ const setVmcStatus = (status) => {
       clearTimeout(rejectedTimeoutTimer);
       rejectedTimeoutTimer = null;
       log("REJECTED TIMER: Cleared (status changed from rejected)");
+    }
+  }
+
+  // Clear auto-purchase timer when leaving enable/empty status
+  if (
+    (vmcStatus === "" || vmcStatus === "enable") &&
+    status !== "" &&
+    status !== "enable"
+  ) {
+    if (autoPurchaseTimer) {
+      clearTimeout(autoPurchaseTimer);
+      autoPurchaseTimer = null;
+      log("AUTO PURCHASE TIMER: Cleared (status changed from enable)");
     }
   }
 
@@ -155,6 +186,19 @@ const setVmcStatus = (status) => {
         runCashOnReset();
       }
     }, REJECTED_TIMEOUT_MS);
+  }
+
+  // Auto-purchase: trigger purchase when returning to enable/empty status
+  if ((status === "" || status === "enable") && !autoPurchaseTimer) {
+    if (autoPurchaseEnabled) {
+      log(
+        `AUTO PURCHASE: Detected idle machine, starting ${AUTO_PURCHASE_DELAY_MS / 1000}s timer`,
+      );
+      autoPurchaseTimer = setTimeout(() => {
+        autoPurchaseTimer = null;
+        triggerAutoPurchase();
+      }, AUTO_PURCHASE_DELAY_MS);
+    }
   }
 };
 
@@ -590,6 +634,9 @@ const processVmcData = async (vmcChar, rawHex = null) => {
 
 server.listen(port, () => {
   log(`NodeJS server listening on port ${port}`);
+  log(
+    `AUTO PURCHASE: ${autoPurchaseEnabled ? "ENABLED (timer-based purchase will run continuously)" : "DISABLED (manual button/socket triggers only)"}`,
+  );
 });
 
 // ============================================================
@@ -625,6 +672,12 @@ setTimeout(() => {
     ]);
 
     writeMdb(configResult, "VMC CONFIGURATION");
+
+    // Kick auto-purchase after initial boot if enabled
+    if (autoPurchaseEnabled && (vmcStatus === "" || vmcStatus === "enable")) {
+      log("AUTO PURCHASE: Initial boot complete, starting first cycle");
+      setVmcStatus(vmcStatus); // re-enter current status to trigger timer
+    }
   }, 5000);
 }, 8000);
 
