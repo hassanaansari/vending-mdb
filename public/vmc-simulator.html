@@ -91,7 +91,7 @@
     <div class="section">
         <h2>Machine Responses</h2>
 
-        <button onclick="send('00')">
+        <button onclick="send('0200')">
             Machine Ready (00)
         </button>
 
@@ -214,10 +214,10 @@
             /*
               1300
               0064 = price 5
-              0003 = product ID 3
+              4131 = product ID 3
             */
 
-            send("130000050003");
+            send("021300000541318A");
         }
 
         function sendCashSale() {

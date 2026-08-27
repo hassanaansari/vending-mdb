@@ -427,21 +427,35 @@ const processVmcData = async (vmcChar, rawHex = null) => {
     // --------------------------------------------------------
 
     if (vmcStatus === "idle") {
-      setVmcStatus("running");
-
       vmcPriceString = "";
 
       const collectedString = vmcChar.substring(vmcChar.indexOf("13"));
 
       const stringLength = collectedString.length;
+      const startByte = collectedString.slice(0, 4);
+
+      // Guard: Only accept product selection (1300) in idle state.
+      // Any other command (e.g., 1304 process end from user clearing screen)
+      // means the machine left the product selection screen — ACK and reset.
+      if (startByte !== "1300") {
+        log(
+          `IDLE GUARD: Received ${startByte} instead of 1300, user likely cleared screen — resetting to enable`,
+        );
+
+        const result = checksum([0x07]);
+        writeMdb(result, "VMC IDLE CANCEL ACK");
+
+        setVmcStatus("enable");
+        return;
+      }
+
+      setVmcStatus("running");
 
       if (stringLength < 14) {
         priceCheck = true;
 
         vmcPriceString += collectedString;
       } else {
-        const startByte = collectedString.slice(0, 4);
-
         if (startByte === "1300") {
           productPriceHex = collectedString.slice(4, 8);
           productId = collectedString.slice(8, 12);
