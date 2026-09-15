@@ -692,8 +692,8 @@ setTimeout(() => {
       log("AUTO PURCHASE: Initial boot complete, starting first cycle");
       setVmcStatus(vmcStatus); // re-enter current status to trigger timer
     }
-  }, 5000);
-}, 8000);
+  }, 30000);
+}, 35000);
 
 // ============================================================
 // Socket.IO - Python Communication
