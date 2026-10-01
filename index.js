@@ -123,7 +123,12 @@ const setVmcStatus = (status) => {
   }
 
   // Clear any running timeout timers when leaving monitored states
-  if (vmcStatus === "idle" && status !== "idle") {
+  // (idleBit keeps the idle timer running while a split command collects)
+  if (
+    (vmcStatus === "idle" || vmcStatus === "idleBit") &&
+    status !== "idle" &&
+    status !== "idleBit"
+  ) {
     if (idleTimeoutTimer) {
       clearTimeout(idleTimeoutTimer);
       idleTimeoutTimer = null;
@@ -154,11 +159,12 @@ const setVmcStatus = (status) => {
 
   vmcStatus = status;
 
-  // Start idle timeout when entering idle status
-  if (status === "idle" && !idleTimeoutTimer) {
+  // Start idle timeout when entering idle status (or idleBit, a split
+  // command still collecting fragments — never leave it unguarded)
+  if ((status === "idle" || status === "idleBit") && !idleTimeoutTimer) {
     log(`IDLE TIMER: Starting ${IDLE_TIMEOUT_MS / 1000}s timeout`);
     idleTimeoutTimer = setTimeout(() => {
-      if (vmcStatus === "idle") {
+      if (vmcStatus === "idle" || vmcStatus === "idleBit") {
         log("IDLE TIMEOUT: Machine stuck in idle for 15s, resetting to enable");
         idleTimeoutTimer = null;
         priceCheck = false;
@@ -300,14 +306,57 @@ const processVmcData = async (vmcChar, rawHex = null) => {
   // Product Price - Multi Packet Response
   // ==========================================================
 
-  if (priceCheck === true && vmcChar !== "00" && vmcStatus === "running") {
+  if (
+    priceCheck === true &&
+    vmcChar !== "00" &&
+    (vmcStatus === "running" || vmcStatus === "idleBit")
+  ) {
     priceCheck = false;
 
     vmcPriceString += vmcChar;
 
     const startByte = vmcPriceString.slice(0, 4);
 
+    // Collecting a command that started in idle (split across serial reads)
+    if (vmcStatus === "idleBit") {
+      // Not enough bytes yet to identify the command — keep waiting
+      if (vmcPriceString.length < 4) {
+        priceCheck = true;
+        return;
+      }
+
+      // Command fully identified but it is not a product selection —
+      // apply the same cancel handling as the idle guard
+      if (startByte !== "1300") {
+        log(
+          `IDLE GUARD: Received ${startByte} instead of 1300, user likely cleared screen — resetting to enable`,
+        );
+
+        const result = checksum([0x07]);
+        writeMdb(result, "VMC IDLE CANCEL ACK");
+
+        setVmcStatus("enable");
+        return;
+      }
+    }
+
     if (startByte === "1300") {
+      // Only parse once the complete command has arrived
+      // (14 chars normally, 18 when the price field is 0000)
+      if (vmcPriceString.length < 14) {
+        priceCheck = true;
+        return;
+      }
+
+      if (vmcPriceString.slice(4, 8) === "0000" && vmcPriceString.length < 18) {
+        priceCheck = true;
+        return;
+      }
+
+      if (vmcStatus === "idleBit") {
+        setVmcStatus("running");
+      }
+
       productPriceHex = vmcPriceString.slice(4, 8);
       productId = vmcPriceString.slice(8, 12);
 
@@ -433,6 +482,16 @@ const processVmcData = async (vmcChar, rawHex = null) => {
 
       const stringLength = collectedString.length;
       const startByte = collectedString.slice(0, 4);
+
+      // Split packet: fragment is shorter than the 4-char command code
+      // (e.g. "130" in one read, "0..." in the next). Move to idleBit and
+      // collect the rest before deciding — the guard must not fire yet.
+      if (stringLength < 4) {
+        setVmcStatus("idleBit");
+        priceCheck = true;
+        vmcPriceString += collectedString;
+        return;
+      }
 
       // Guard: Only accept product selection (1300) in idle state.
       // Any other command (e.g., 1304 process end from user clearing screen)
