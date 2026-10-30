@@ -137,7 +137,7 @@ const triggerAutoPurchase = () => {
 
   setVmcStatus("connect");
 
-  const result = checksum([0x03, 0x03, 0xe8]);
+  const result = checksum([0x03, 0xff, 0xff]);
   writeMdb(result, "VMC AUTO PURCHASE REQUEST");
 };
 
@@ -372,7 +372,8 @@ const describeMdbFrame = (bytes, payload) => {
   } else if (command === 0x11) {
     interpretation = "MDB SETUP (0x11) with unknown VMC data";
   } else if (command === 0x12) {
-    interpretation = "MDB POLL (0x12) - answered automatically by the Pi2MDB adapter";
+    interpretation =
+      "MDB POLL (0x12) - answered automatically by the Pi2MDB adapter";
   } else if (command === 0x14 && bytes[1] === 0x01) {
     interpretation =
       "VMC READER ENABLE (0x14 0x01) - documented successful connection signal (140115)";
@@ -555,7 +556,10 @@ const beginHandshake = (reason, isRecovery) => {
   }
 
   if (handshakeExhausted) {
-    log("VMC INITIALIZATION: Not started (handshake attempts exhausted)", reason);
+    log(
+      "VMC INITIALIZATION: Not started (handshake attempts exhausted)",
+      reason,
+    );
     return;
   }
 
@@ -575,7 +579,9 @@ const beginHandshake = (reason, isRecovery) => {
 
   handshakeTimer = setTimeout(() => {
     handshakeTimer = null;
-    failHandshake(`no READER ENABLE (140115) within ${HANDSHAKE_TIMEOUT_MS / 1000}s`);
+    failHandshake(
+      `no READER ENABLE (140115) within ${HANDSHAKE_TIMEOUT_MS / 1000}s`,
+    );
   }, HANDSHAKE_TIMEOUT_MS);
 };
 
@@ -596,7 +602,8 @@ const completeHandshake = (frameInfo) => {
     interpretation: frameInfo.interpretation,
   });
   log("VMC CASHLESS READY", {
-    evidence: "READER ENABLE (140115) received - documented Pi2MDB/MDB handshake complete",
+    evidence:
+      "READER ENABLE (140115) received - documented Pi2MDB/MDB handshake complete",
     lastReceivedFrame,
   });
 
@@ -622,20 +629,17 @@ const handleVmcReset = (frameInfo) => {
     status: vmcStatus,
   });
 
-  // Documented MDB response to RESET: JUST RESET (00 00). It makes the VMC
-  // read the adapter's config data again and re-run its initialization.
-  writeMdb(checksum([0x00]), "VMC INITIALIZATION COMMAND (JUST RESET)");
+  // Do not transmit 00 00 here.
+  // The Pi2MDB manual does not identify 00 00 as the
+  // command that asks the VMC to reread its saved config.
 
   if (initializationInProgress) {
-    log(
-      "VMC RESET DETECTED: already waiting for READER ENABLE (140115) - no overlapping sequence started",
-    );
+    log("VMC RESET DETECTED: already waiting for READER ENABLE (140115)");
     return;
   }
 
   beginHandshake(`VMC reset cashless device 1 (${frameInfo.hex})`, true);
 };
-
 const handleVmcInitializationMessage = (frameInfo, frameBytes) => {
   noteLastFrame(frameInfo);
 
@@ -1216,9 +1220,9 @@ serialPort.on("close", () => {
 
 beginHandshake("startup", false);
 
-setTimeout(() => {
-  writeMdb(checksum([0x00]), "VMC INITIALIZATION COMMAND (JUST RESET)");
-}, 5000);
+// setTimeout(() => {
+//   writeMdb(checksum([0x00]), "VMC INITIALIZATION COMMAND (JUST RESET)");
+// }, 5000);
 
 setTimeout(() => {
   writeMdb(
@@ -1273,7 +1277,7 @@ io.on("connection", (socket) => {
 
     setVmcStatus("connect");
 
-    const result = checksum([0x03, 0x03, 0xe8]);
+    const result = checksum([0x03, 0xff, 0xff]);
 
     writeMdb(result, "VMC PURCHASE REQUEST");
   });
@@ -1297,7 +1301,7 @@ io.on("connection", (socket) => {
 
     setVmcStatus("connect");
 
-    const result = checksum([0x03, 0x03, 0xe8]);
+    const result = checksum([0x03, 0xff, 0xff]);
 
     writeMdb(result, "VMC PURCHASE REQUEST");
   });
