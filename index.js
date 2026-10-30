@@ -58,7 +58,7 @@ let idleTimeoutTimer = null;
 let rejectedTimeoutTimer = null;
 let autoPurchaseTimer = null;
 
-const IDLE_TIMEOUT_MS = 15000; // 15 seconds
+const IDLE_TIMEOUT_MS = 60000; // 60 seconds
 const REJECTED_TIMEOUT_MS = 5000; // 5 seconds
 const AUTO_PURCHASE_DELAY_MS = 4000; // 2 seconds delay before auto-purchase
 
@@ -674,23 +674,23 @@ serialPort.on("close", () => {
 // ============================================================
 
 setTimeout(() => {
-  // Reset
-  const result = checksum([0x00]);
+  log("VMC STARTUP: Sending reset after 35 seconds");
 
+  const result = checksum([0x00]);
   writeMdb(result, "VMC RESET");
 
   setTimeout(() => {
-    // Configuration Data
+    log("VMC STARTUP: Sending configuration 30 seconds after reset");
+
     const configResult = checksum([
       0x01, 0x03, 0x15, 0x86, 0x01, 0x00, 0x05, 0x0c,
     ]);
 
     writeMdb(configResult, "VMC CONFIGURATION");
 
-    // Kick auto-purchase after initial boot if enabled
     if (autoPurchaseEnabled && (vmcStatus === "" || vmcStatus === "enable")) {
       log("AUTO PURCHASE: Initial boot complete, starting first cycle");
-      setVmcStatus(vmcStatus); // re-enter current status to trigger timer
+      setVmcStatus(vmcStatus);
     }
   }, 30000);
 }, 35000);
