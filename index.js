@@ -57,10 +57,23 @@ let processEndString = "";
 let idleTimeoutTimer = null;
 let rejectedTimeoutTimer = null;
 let autoPurchaseTimer = null;
+let connectTimeoutTimer = null;
+let initSequenceTimer = null;
+let initReadyTimer = null;
 
 const IDLE_TIMEOUT_MS = 15000; // 15 seconds
 const REJECTED_TIMEOUT_MS = 5000; // 5 seconds
 const AUTO_PURCHASE_DELAY_MS = 4000; // 2 seconds delay before auto-purchase
+const CONNECT_TIMEOUT_MS = 10000; // watchdog while waiting in "connect"
+const INIT_STEP_DELAY_MS = 3000; // delay between the two initialization commands
+const READY_RESPONSE_TIMEOUT_MS = 5000; // fallback when the VMC stays silent after initialization
+
+// Initialization / reset recovery state (see "MDB Frame Decoding" below)
+let initializationInProgress = false;
+let initializationSequenceDone = false;
+let initValidResponseReceived = false;
+let initEvidenceHex = null;
+let recoveryMode = false;
 
 let vmcTest;
 
@@ -79,6 +92,11 @@ const log = (message, data = null) => {
 };
 
 const runCashOnReset = () => {
+  if (initializationInProgress) {
+    log("AUTO RESET: Skipped (VMC initialization/recovery in progress)");
+    return;
+  }
+
   log("AUTO RESET: Running cash on sequence (machine stuck recovery)");
 
   setVmcStatus("enable");
@@ -104,6 +122,11 @@ const runCashOnReset = () => {
 };
 
 const triggerAutoPurchase = () => {
+  if (initializationInProgress) {
+    log("AUTO PURCHASE: Skipped (VMC initialization/recovery in progress)");
+    return;
+  }
+
   if (vmcStatus !== "" && vmcStatus !== "enable") {
     log(`AUTO PURCHASE: Skipped (vmcStatus="${vmcStatus}")`);
     return;
@@ -194,9 +217,36 @@ const setVmcStatus = (status) => {
     }, REJECTED_TIMEOUT_MS);
   }
 
+  // Connection watchdog: never stay in "connect" waiting forever for the
+  // VMC to acknowledge a purchase request.
+  if (status === "connect") {
+    if (!connectTimeoutTimer) {
+      log(`CONNECT WATCHDOG: Starting ${CONNECT_TIMEOUT_MS / 1000}s timeout`);
+      connectTimeoutTimer = setTimeout(() => {
+        connectTimeoutTimer = null;
+
+        if (vmcStatus === "connect") {
+          log("VMC CONNECTION TIMEOUT", {
+            waitedMs: CONNECT_TIMEOUT_MS,
+            interpretation: "No valid VMC response to the purchase request",
+            status: vmcStatus,
+          });
+
+          startRecovery("connection timeout");
+        }
+      }, CONNECT_TIMEOUT_MS);
+    }
+  } else if (connectTimeoutTimer) {
+    clearTimeout(connectTimeoutTimer);
+    connectTimeoutTimer = null;
+    log("CONNECT WATCHDOG: Cleared (status changed from connect)");
+  }
+
   // Auto-purchase: trigger purchase when returning to enable/empty status
   if ((status === "" || status === "enable") && !autoPurchaseTimer) {
-    if (autoPurchaseEnabled) {
+    if (initializationInProgress) {
+      log("AUTO PURCHASE: Suppressed (VMC initialization/recovery in progress)");
+    } else if (autoPurchaseEnabled) {
       log(
         `AUTO PURCHASE: Detected idle machine, starting ${AUTO_PURCHASE_DELAY_MS / 1000}s timer`,
       );
@@ -246,6 +296,328 @@ const checksum = (array) => {
 };
 
 // ============================================================
+// MDB Frame Decoding (HAT serial protocol)
+// ============================================================
+//
+// The HAT forwards raw MDB bus traffic as ASCII-hex text between STX (0x02)
+// and ETX (0x03). Example: raw '02 31 30 31 30 03' -> payload "1010" ->
+// MDB frame bytes 10 10. The first byte is the MDB address/command byte
+// (cashless device 1 lives at address 0x10), the last byte is the additive
+// checksum used everywhere else in this application (see checksum()).
+//
+// Known VMC -> cashless device 1 command bytes:
+//   0x10 RESET        0x11 SETUP          0x12 POLL
+//   0x13 VEND         0x14 READER         0x17 EXPANSION
+
+const stripFrameDelimiters = (text) => text.replace(/[\x02\x03]/g, "");
+
+const decodeMdbPayload = (payload) => {
+  if (!/^[0-9a-fA-F]+$/.test(payload)) {
+    return null;
+  }
+
+  // Serial reads can be truncated; decode complete byte pairs only.
+  const usableLength = payload.length - (payload.length % 2);
+  const bytes = [];
+
+  for (let i = 0; i < usableLength; i += 2) {
+    bytes.push(parseInt(payload.substring(i, i + 2), 16));
+  }
+
+  return bytes.length > 0 ? bytes : null;
+};
+
+const describeMdbFrame = (bytes, payload) => {
+  const hex = Buffer.from(bytes).toString("hex").toUpperCase();
+  const incomplete = payload.length % 2 !== 0;
+
+  let checksumValue = 0x00;
+  for (let i = 0; i < bytes.length - 1; i++) {
+    checksumValue += bytes[i];
+  }
+  checksumValue &= 0xff;
+
+  const hasChecksum = bytes.length > 1;
+  const checksumByte = hasChecksum ? bytes[bytes.length - 1] : null;
+  const checksumOk = hasChecksum && checksumValue === checksumByte;
+
+  const command = bytes[0];
+  let interpretation = "Unrecognized MDB frame";
+
+  if (command === 0x00) {
+    interpretation = "MDB ACK from VMC (0x00)";
+  } else if (command === 0x10) {
+    interpretation =
+      "MDB CASHLESS DEVICE 1 RESET: command byte 0x10 (device address 0x10 + command 0x00 RESET) + checksum 0x10";
+  } else if (command === 0x11 && bytes[1] === 0x00) {
+    interpretation = "MDB SETUP / CONFIGURATION DATA REQUEST (0x11 0x00)";
+    if (bytes.length > 3) {
+      interpretation += ` + ${bytes.length - 3} extra byte(s) not defined by the MDB cashless SETUP command`;
+    }
+  } else if (command === 0x11 && bytes[1] === 0x01 && bytes.length >= 6) {
+    const minPrice = bytes[2] | (bytes[3] << 8);
+    const maxPrice = bytes[4] | (bytes[5] << 8);
+    interpretation = `MDB SETUP / MIN-MAX PRICE (0x11 0x01): min=${minPrice} max=${maxPrice}`;
+  } else if (command === 0x11) {
+    interpretation = "MDB SETUP (0x11) with unknown VMC data";
+  } else if (command === 0x12) {
+    interpretation = "MDB POLL (0x12)";
+  } else if (command === 0x14 && bytes[1] === 0x01) {
+    interpretation = "MDB READER ENABLE (0x14 0x01)";
+  } else if (command === 0x14) {
+    interpretation = "MDB READER CONTROL (0x14)";
+  } else if (command === 0x17) {
+    const subCommand = bytes[1] ?? 0x00;
+    interpretation = `MDB EXPANSION (0x17 sub-command 0x${subCommand
+      .toString(16)
+      .toUpperCase()
+      .padStart(2, "0")})`;
+
+    const asciiData = bytes
+      .slice(2, Math.max(2, bytes.length - 1))
+      .map((b) => (b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : "."))
+      .join("");
+
+    if (asciiData.trim().length > 0) {
+      interpretation += ` data ASCII "${asciiData}"`;
+    }
+  }
+
+  return {
+    hex,
+    interpretation,
+    incomplete,
+    checksumOk,
+    checksumValue,
+    checksumByte,
+  };
+};
+
+const describeChecksum = (frameInfo) => {
+  if (frameInfo.checksumByte === null) {
+    return "n/a";
+  }
+
+  const expected = frameInfo.checksumValue
+    .toString(16)
+    .toUpperCase()
+    .padStart(2, "0");
+  const received = frameInfo.checksumByte
+    .toString(16)
+    .toUpperCase()
+    .padStart(2, "0");
+
+  return frameInfo.checksumOk
+    ? "ok"
+    : `mismatch (expected 0x${expected}, received 0x${received})`;
+};
+
+// ============================================================
+// Initialization / Reset Recovery
+// ============================================================
+//
+// The VMC can reset cashless device 1 at any time (MDB frame "1010").
+// The device must then be re-initialized before new purchase requests are
+// sent, otherwise the machine keeps resetting us and the application stays
+// stuck in "connect". The recovery replays the same initialization sequence
+// this application already uses at startup (RESET + CONFIGURATION commands
+// of the supported HAT protocol); no MDB responses are invented for frames
+// the HAT protocol does not define a response for.
+
+const clearTransactionState = () => {
+  priceCheck = false;
+  dropSensor = false;
+  processEnd = false;
+  cashSaleCheck = false;
+  vmcPriceString = "";
+  vmcCashString = "";
+  dropSensorString = "";
+  processEndString = "";
+  productPriceHex = "";
+  productPrice = undefined;
+  productId = undefined;
+};
+
+const cancelObsoleteTimers = () => {
+  if (idleTimeoutTimer) {
+    clearTimeout(idleTimeoutTimer);
+    idleTimeoutTimer = null;
+    log("IDLE TIMER: Cleared (VMC reset/recovery)");
+  }
+
+  if (rejectedTimeoutTimer) {
+    clearTimeout(rejectedTimeoutTimer);
+    rejectedTimeoutTimer = null;
+    log("REJECTED TIMER: Cleared (VMC reset/recovery)");
+  }
+
+  if (autoPurchaseTimer) {
+    clearTimeout(autoPurchaseTimer);
+    autoPurchaseTimer = null;
+    log("AUTO PURCHASE TIMER: Cleared (VMC reset/recovery)");
+  }
+
+  if (connectTimeoutTimer) {
+    clearTimeout(connectTimeoutTimer);
+    connectTimeoutTimer = null;
+    log("CONNECT WATCHDOG: Cleared (VMC reset/recovery)");
+  }
+
+  if (initReadyTimer) {
+    clearTimeout(initReadyTimer);
+    initReadyTimer = null;
+    log("INIT READY TIMER: Cleared (VMC reset/recovery)");
+  }
+};
+
+const evaluateCashlessReady = () => {
+  if (!initializationInProgress || !initializationSequenceDone) {
+    return;
+  }
+
+  if (initValidResponseReceived) {
+    completeInitialization(`valid VMC response ${initEvidenceHex}`);
+    return;
+  }
+
+  if (!initReadyTimer) {
+    log(
+      `VMC INITIALIZATION: Waiting for a valid VMC response (max ${READY_RESPONSE_TIMEOUT_MS / 1000}s)`,
+    );
+    initReadyTimer = setTimeout(() => {
+      initReadyTimer = null;
+      completeInitialization(
+        `no valid VMC response within ${READY_RESPONSE_TIMEOUT_MS / 1000}s after initialization (compatibility fallback)`,
+      );
+    }, READY_RESPONSE_TIMEOUT_MS);
+  }
+};
+
+const completeInitialization = (evidence) => {
+  if (initReadyTimer) {
+    clearTimeout(initReadyTimer);
+    initReadyTimer = null;
+  }
+
+  initializationInProgress = false;
+  initializationSequenceDone = false;
+
+  log("VMC CASHLESS READY", { evidence });
+
+  if (recoveryMode) {
+    recoveryMode = false;
+    log("VMC RECOVERY COMPLETED", { evidence });
+
+    // Restore the enabled state; this re-arms the existing AUTO_PURCHASE timer
+    setVmcStatus("enable");
+    return;
+  }
+
+  // Kick auto-purchase after initial boot if enabled (existing behavior)
+  if (autoPurchaseEnabled && (vmcStatus === "" || vmcStatus === "enable")) {
+    log("AUTO PURCHASE: Initial boot complete, starting first cycle");
+    setVmcStatus(vmcStatus); // re-enter current status to trigger timer
+  }
+};
+
+const startInitialization = (source) => {
+  if (initializationInProgress) {
+    log(
+      "VMC INITIALIZATION: Start request ignored (initialization already in progress)",
+      source,
+    );
+    return;
+  }
+
+  initializationInProgress = true;
+  initializationSequenceDone = false;
+  initValidResponseReceived = false;
+  initEvidenceHex = null;
+
+  log("VMC INITIALIZATION STARTED", { source });
+
+  // Reset
+  const resetResult = checksum([0x00]);
+  writeMdb(resetResult, "VMC INITIALIZATION COMMAND (RESET)");
+
+  initSequenceTimer = setTimeout(() => {
+    initSequenceTimer = null;
+
+    // Configuration Data
+    const configResult = checksum([
+      0x01, 0x03, 0x15, 0x86, 0x01, 0x00, 0x05, 0x0c,
+    ]);
+    writeMdb(configResult, "VMC INITIALIZATION COMMAND (CONFIGURATION)");
+
+    initializationSequenceDone = true;
+    log("VMC INITIALIZATION COMPLETED", { source });
+
+    if (recoveryMode) {
+      // Recovery only restores AUTO_PURCHASE once the VMC has proven it is
+      // talking to us again (or the compatibility fallback expires).
+      evaluateCashlessReady();
+    } else {
+      // Boot keeps the original startup behavior/timing.
+      completeInitialization("startup initialization sequence completed");
+    }
+  }, INIT_STEP_DELAY_MS);
+};
+
+const startRecovery = (reason) => {
+  log("VMC RECOVERY STARTED", { reason });
+
+  recoveryMode = true;
+
+  cancelObsoleteTimers();
+  clearTransactionState();
+  setVmcStatus("init");
+
+  startInitialization("recovery");
+};
+
+const markValidVmcResponse = (hex) => {
+  initValidResponseReceived = true;
+  initEvidenceHex = hex;
+  evaluateCashlessReady();
+};
+
+const handleVmcReset = (frameInfo) => {
+  log("VMC RESET DETECTED", {
+    hex: frameInfo.hex,
+    interpretation: frameInfo.interpretation,
+    checksum: describeChecksum(frameInfo),
+    status: vmcStatus,
+  });
+
+  if (initializationInProgress) {
+    log(
+      "VMC RESET DETECTED: Ignored (initialization/recovery already in progress - no overlapping sequences)",
+    );
+    return;
+  }
+
+  startRecovery(`VMC reset cashless device 1 (${frameInfo.hex})`);
+};
+
+const handleVmcInitializationMessage = (frameInfo) => {
+  log("VMC INITIALIZATION RESPONSE", {
+    hex: frameInfo.hex,
+    interpretation: frameInfo.interpretation,
+    checksum: describeChecksum(frameInfo),
+    status: vmcStatus,
+  });
+
+  if (!frameInfo.incomplete && frameInfo.checksumOk) {
+    markValidVmcResponse(frameInfo.hex);
+    return;
+  }
+
+  log(
+    "VMC INITIALIZATION RESPONSE: Not counted as ready evidence (frame incomplete or checksum mismatch) - no response sent (the HAT protocol defines none for this frame)",
+  );
+};
+
+// ============================================================
 // Dummy Test Socket function in place of vending machine
 // ============================================================
 const processVmcData = async (vmcChar, rawHex = null) => {
@@ -257,6 +629,52 @@ const processVmcData = async (vmcChar, rawHex = null) => {
       data: vmcChar,
       status: vmcStatus,
     });
+  }
+
+  // ==========================================================
+  // MDB Frame Decoding (HAT serial protocol)
+  // ==========================================================
+
+  const payload = stripFrameDelimiters(vmcChar);
+  const frameBytes = decodeMdbPayload(payload);
+
+  if (frameBytes) {
+    const command = frameBytes[0];
+
+    // VMC-initiated reset of cashless device 1 ("1010")
+    if (command === 0x10 && frameBytes.length >= 2) {
+      handleVmcReset(describeMdbFrame(frameBytes, payload));
+      return;
+    }
+
+    // VMC initialization / management commands (SETUP/POLL/READER/EXPANSION)
+    if (
+      frameBytes.length >= 2 &&
+      (command === 0x11 ||
+        command === 0x12 ||
+        command === 0x14 ||
+        command === 0x17)
+    ) {
+      handleVmcInitializationMessage(describeMdbFrame(frameBytes, payload));
+      return;
+    }
+
+    // ACK (0x00) and VEND traffic (0x13) keep the existing handling below
+    if (command === 0x00 || command === 0x13) {
+      markValidVmcResponse(payload.toUpperCase());
+    } else if (frameBytes.length >= 2) {
+      // Unknown frames must never change state and must never provoke an
+      // ACK/RESET/CASH ON/purchase response.
+      const frameInfo = describeMdbFrame(frameBytes, payload);
+      log("VMC UNKNOWN RESPONSE", {
+        hex: frameInfo.hex,
+        interpretation: frameInfo.interpretation,
+        checksum: describeChecksum(frameInfo),
+        status: vmcStatus,
+        action: "ignored (no response sent for unknown frames)",
+      });
+      return;
+    }
   }
 
   // ==========================================================
@@ -731,27 +1149,13 @@ serialPort.on("close", () => {
 // ============================================================
 // Initial VMC Configuration
 // ============================================================
+//
+// Same sequence as before: RESET after 5s, CONFIGURATION 3s later, then the
+// AUTO_PURCHASE kick (see completeInitialization). Also reused by reset
+// recovery so both paths initialize the cashless device identically.
 
 setTimeout(() => {
-  // Reset
-  const result = checksum([0x00]);
-
-  writeMdb(result, "VMC RESET");
-
-  setTimeout(() => {
-    // Configuration Data
-    const configResult = checksum([
-      0x01, 0x03, 0x15, 0x86, 0x01, 0x00, 0x05, 0x0c,
-    ]);
-
-    writeMdb(configResult, "VMC CONFIGURATION");
-
-    // Kick auto-purchase after initial boot if enabled
-    if (autoPurchaseEnabled && (vmcStatus === "" || vmcStatus === "enable")) {
-      log("AUTO PURCHASE: Initial boot complete, starting first cycle");
-      setVmcStatus(vmcStatus); // re-enter current status to trigger timer
-    }
-  }, 3000);
+  startInitialization("startup");
 }, 5000);
 
 // ============================================================
