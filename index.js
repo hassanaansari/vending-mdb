@@ -98,9 +98,9 @@ const runCashOnReset = () => {
         const result4 = checksum([0x07]);
         writeMdb(result4, "VMC CASH MODE STEP 4");
         log("AUTO RESET: Cash mode sequence completed");
-      }, 1000);
-    }, 1000);
-  }, 1000);
+      }, 100);
+    }, 100);
+  }, 100);
 };
 
 const triggerAutoPurchase = () => {
