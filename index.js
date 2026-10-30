@@ -58,22 +58,23 @@ let idleTimeoutTimer = null;
 let rejectedTimeoutTimer = null;
 let autoPurchaseTimer = null;
 let connectTimeoutTimer = null;
-let initSequenceTimer = null;
-let initReadyTimer = null;
+let handshakeTimer = null;
 
 const IDLE_TIMEOUT_MS = 15000; // 15 seconds
 const REJECTED_TIMEOUT_MS = 5000; // 5 seconds
 const AUTO_PURCHASE_DELAY_MS = 4000; // 2 seconds delay before auto-purchase
 const CONNECT_TIMEOUT_MS = 10000; // watchdog while waiting in "connect"
-const INIT_STEP_DELAY_MS = 3000; // delay between the two initialization commands
-const READY_RESPONSE_TIMEOUT_MS = 5000; // fallback when the VMC stays silent after initialization
+const HANDSHAKE_TIMEOUT_MS = 15000; // documented init handshake must complete in this time
+const MAX_CONSECUTIVE_HANDSHAKE_FAILURES = 3; // then park in error state
 
-// Initialization / reset recovery state (see "MDB Frame Decoding" below)
+// Initialization handshake state (see "Initialization Handshake" below)
 let initializationInProgress = false;
-let initializationSequenceDone = false;
-let initValidResponseReceived = false;
-let initEvidenceHex = null;
 let recoveryMode = false;
+let vmcError = false;
+let handshakeExhausted = false;
+let handshakeStep = "not started";
+let lastReceivedFrame = "none";
+let consecutiveHandshakeFailures = 0;
 
 let vmcTest;
 
@@ -92,8 +93,8 @@ const log = (message, data = null) => {
 };
 
 const runCashOnReset = () => {
-  if (initializationInProgress) {
-    log("AUTO RESET: Skipped (VMC initialization/recovery in progress)");
+  if (initializationInProgress || vmcError) {
+    log("AUTO RESET: Skipped (initialization/error state)");
     return;
   }
 
@@ -122,8 +123,8 @@ const runCashOnReset = () => {
 };
 
 const triggerAutoPurchase = () => {
-  if (initializationInProgress) {
-    log("AUTO PURCHASE: Skipped (VMC initialization/recovery in progress)");
+  if (initializationInProgress || vmcError) {
+    log("AUTO PURCHASE: Skipped (initialization/error state)");
     return;
   }
 
@@ -229,10 +230,13 @@ const setVmcStatus = (status) => {
           log("VMC CONNECTION TIMEOUT", {
             waitedMs: CONNECT_TIMEOUT_MS,
             interpretation: "No valid VMC response to the purchase request",
+            lastReceivedFrame,
             status: vmcStatus,
           });
 
-          startRecovery("connection timeout");
+          failHandshake(
+            "connection timeout: no valid VMC response to the purchase request",
+          );
         }
       }, CONNECT_TIMEOUT_MS);
     }
@@ -244,8 +248,8 @@ const setVmcStatus = (status) => {
 
   // Auto-purchase: trigger purchase when returning to enable/empty status
   if ((status === "" || status === "enable") && !autoPurchaseTimer) {
-    if (initializationInProgress) {
-      log("AUTO PURCHASE: Suppressed (VMC initialization/recovery in progress)");
+    if (initializationInProgress || vmcError) {
+      log("AUTO PURCHASE: Suppressed (initialization/error state)");
     } else if (autoPurchaseEnabled) {
       log(
         `AUTO PURCHASE: Detected idle machine, starting ${AUTO_PURCHASE_DELAY_MS / 1000}s timer`,
@@ -345,33 +349,50 @@ const describeMdbFrame = (bytes, payload) => {
   let interpretation = "Unrecognized MDB frame";
 
   if (command === 0x00) {
-    interpretation = "MDB ACK from VMC (0x00)";
+    interpretation =
+      "MDB ACK / adapter serial ACK (0x00) - acknowledges a frame, not readiness";
   } else if (command === 0x10) {
     interpretation =
       "MDB CASHLESS DEVICE 1 RESET: command byte 0x10 (device address 0x10 + command 0x00 RESET) + checksum 0x10";
   } else if (command === 0x11 && bytes[1] === 0x00) {
-    interpretation = "MDB SETUP / CONFIGURATION DATA REQUEST (0x11 0x00)";
-    if (bytes.length > 3) {
-      interpretation += ` + ${bytes.length - 3} extra byte(s) not defined by the MDB cashless SETUP command`;
+    interpretation = "VMC SETUP - CONFIG DATA (0x11 0x00)";
+    if (bytes.length >= 6) {
+      interpretation += `: VMC level=${bytes[2]} columns=${bytes[3]} rows=${bytes[4]} display=0x${bytes[5]
+        .toString(16)
+        .toUpperCase()
+        .padStart(2, "0")}`;
+    }
+    if (bytes.length > 7) {
+      interpretation += ` + ${bytes.length - 7} extra byte(s)`;
     }
   } else if (command === 0x11 && bytes[1] === 0x01 && bytes.length >= 6) {
-    const minPrice = bytes[2] | (bytes[3] << 8);
-    const maxPrice = bytes[4] | (bytes[5] << 8);
-    interpretation = `MDB SETUP / MIN-MAX PRICE (0x11 0x01): min=${minPrice} max=${maxPrice}`;
+    const maxPrice = (bytes[2] << 8) | bytes[3];
+    const minPrice = (bytes[4] << 8) | bytes[5];
+    interpretation = `VMC SETUP - MAX/MIN PRICE (0x11 0x01): max=${maxPrice} min=${minPrice} (0xFFFF/0x0000 = unknown)`;
   } else if (command === 0x11) {
     interpretation = "MDB SETUP (0x11) with unknown VMC data";
   } else if (command === 0x12) {
-    interpretation = "MDB POLL (0x12)";
+    interpretation = "MDB POLL (0x12) - answered automatically by the Pi2MDB adapter";
   } else if (command === 0x14 && bytes[1] === 0x01) {
-    interpretation = "MDB READER ENABLE (0x14 0x01)";
+    interpretation =
+      "VMC READER ENABLE (0x14 0x01) - documented successful connection signal (140115)";
+  } else if (command === 0x14 && bytes[1] === 0x02) {
+    interpretation = "VMC READER CANCEL (0x14 0x02)";
   } else if (command === 0x14) {
-    interpretation = "MDB READER CONTROL (0x14)";
+    interpretation = "VMC READER DISABLE (0x14 0x00)";
   } else if (command === 0x17) {
     const subCommand = bytes[1] ?? 0x00;
-    interpretation = `MDB EXPANSION (0x17 sub-command 0x${subCommand
-      .toString(16)
-      .toUpperCase()
-      .padStart(2, "0")})`;
+    if (subCommand === 0x00) {
+      interpretation =
+        "VMC EXPANSION REQUEST ID (0x17 0x00) carrying the VMC identity";
+    } else if (subCommand === 0x04) {
+      interpretation = "VMC EXPANSION FEATURE ENABLE (0x17 0x04)";
+    } else {
+      interpretation = `MDB EXPANSION (0x17 sub-command 0x${subCommand
+        .toString(16)
+        .toUpperCase()
+        .padStart(2, "0")})`;
+    }
 
     const asciiData = bytes
       .slice(2, Math.max(2, bytes.length - 1))
@@ -413,16 +434,31 @@ const describeChecksum = (frameInfo) => {
 };
 
 // ============================================================
-// Initialization / Reset Recovery
+// Initialization Handshake (Pi2MDB adapter protocol)
 // ============================================================
 //
-// The VMC can reset cashless device 1 at any time (MDB frame "1010").
-// The device must then be re-initialized before new purchase requests are
-// sent, otherwise the machine keeps resetting us and the application stays
-// stuck in "connect". The recovery replays the same initialization sequence
-// this application already uses at startup (RESET + CONFIGURATION commands
-// of the supported HAT protocol); no MDB responses are invented for frames
-// the HAT protocol does not define a response for.
+// Verified against the Pi2MDB converter manual (Wafer Microelectronics):
+//  - "Adapter box will reply the poll command from VMC automatically."
+//  - "When power on, Adapter box will reply the Config data that is saved in
+//     the memory to VMC" (the host stores that data once with the 0x01 frame).
+//  - "Any data from VMC except the poll command will be redirected to RS232
+//     port" - SETUP/EXPANSION/READER/VEND/RESET reach the host for information.
+//  - "Any data ... send ... together with checksum, then the adapter board
+//     will send to VMC during the VMC poll request" - host frames are queued
+//     and delivered as the next POLL response.
+//  - "the adapter will reply you '00'" - a bare 00 is the adapter's serial ACK
+//     of a host frame. It is NEVER initialization evidence.
+//  - "If you can get the data 140115, Then ... PC2MDB adapter has successfully
+//     connected to VMC" - READER ENABLE (14 01 15) IS the documented
+//     initialization handshake completion.
+//
+// So the host must answer NONE of 0x11/0x12/0x14/0x17: the adapter owns those
+// exchanges ("You don't need to do anythings"). The host's only initialization
+// duty is to answer a VMC RESET (0x10) with JUST RESET (00 00 - the app's
+// existing "VMC RESET" frame, which makes the VMC read the config data again)
+// and to wait for 140115 before starting any session (03 03 E8 ...). Starting
+// a session while the machine is still initializing is exactly what provoked
+// the endless RESET loop.
 
 const clearTransactionState = () => {
   priceCheck = false;
@@ -463,125 +499,122 @@ const cancelObsoleteTimers = () => {
     log("CONNECT WATCHDOG: Cleared (VMC reset/recovery)");
   }
 
-  if (initReadyTimer) {
-    clearTimeout(initReadyTimer);
-    initReadyTimer = null;
-    log("INIT READY TIMER: Cleared (VMC reset/recovery)");
+  if (handshakeTimer) {
+    clearTimeout(handshakeTimer);
+    handshakeTimer = null;
+    log("HANDSHAKE TIMER: Cleared (VMC reset/recovery)");
   }
 };
 
-const evaluateCashlessReady = () => {
-  if (!initializationInProgress || !initializationSequenceDone) {
-    return;
-  }
-
-  if (initValidResponseReceived) {
-    completeInitialization(`valid VMC response ${initEvidenceHex}`);
-    return;
-  }
-
-  if (!initReadyTimer) {
-    log(
-      `VMC INITIALIZATION: Waiting for a valid VMC response (max ${READY_RESPONSE_TIMEOUT_MS / 1000}s)`,
-    );
-    initReadyTimer = setTimeout(() => {
-      initReadyTimer = null;
-      completeInitialization(
-        `no valid VMC response within ${READY_RESPONSE_TIMEOUT_MS / 1000}s after initialization (compatibility fallback)`,
-      );
-    }, READY_RESPONSE_TIMEOUT_MS);
-  }
+const noteLastFrame = (frameInfo) => {
+  lastReceivedFrame = `${frameInfo.hex} (${frameInfo.interpretation})`;
 };
 
-const completeInitialization = (evidence) => {
-  if (initReadyTimer) {
-    clearTimeout(initReadyTimer);
-    initReadyTimer = null;
+const failHandshake = (reason) => {
+  if (handshakeTimer) {
+    clearTimeout(handshakeTimer);
+    handshakeTimer = null;
   }
 
   initializationInProgress = false;
-  initializationSequenceDone = false;
+  vmcError = true;
+  consecutiveHandshakeFailures += 1;
 
-  log("VMC CASHLESS READY", { evidence });
+  log("VMC INITIALIZATION FAILED", {
+    reason,
+    failedStep: handshakeStep,
+    lastReceivedFrame,
+    status: vmcStatus,
+    consecutiveFailures: consecutiveHandshakeFailures,
+  });
 
   if (recoveryMode) {
     recoveryMode = false;
-    log("VMC RECOVERY COMPLETED", { evidence });
-
-    // Restore the enabled state; this re-arms the existing AUTO_PURCHASE timer
-    setVmcStatus("enable");
-    return;
+    log("VMC RECOVERY COMPLETED", {
+      outcome: "failed",
+      failedStep: handshakeStep,
+      lastReceivedFrame,
+    });
   }
 
-  // Kick auto-purchase after initial boot if enabled (existing behavior)
-  if (autoPurchaseEnabled && (vmcStatus === "" || vmcStatus === "enable")) {
-    log("AUTO PURCHASE: Initial boot complete, starting first cycle");
-    setVmcStatus(vmcStatus); // re-enter current status to trigger timer
+  if (consecutiveHandshakeFailures >= MAX_CONSECUTIVE_HANDSHAKE_FAILURES) {
+    handshakeExhausted = true;
+    log(
+      "VMC INITIALIZATION FAILED: handshake attempts exhausted - no further automatic sessions will be started (restart the application to retry)",
+    );
   }
 };
 
-const startInitialization = (source) => {
+const beginHandshake = (reason, isRecovery) => {
   if (initializationInProgress) {
     log(
-      "VMC INITIALIZATION: Start request ignored (initialization already in progress)",
-      source,
+      "VMC INITIALIZATION: Already waiting for READER ENABLE (140115) - no overlapping sequence started",
+      reason,
     );
     return;
   }
 
-  initializationInProgress = true;
-  initializationSequenceDone = false;
-  initValidResponseReceived = false;
-  initEvidenceHex = null;
-
-  log("VMC INITIALIZATION STARTED", { source });
-
-  // Reset
-  const resetResult = checksum([0x00]);
-  writeMdb(resetResult, "VMC INITIALIZATION COMMAND (RESET)");
-
-  initSequenceTimer = setTimeout(() => {
-    initSequenceTimer = null;
-
-    // Configuration Data
-    const configResult = checksum([
-      0x01, 0x03, 0x15, 0x86, 0x01, 0x00, 0x05, 0x0c,
-    ]);
-    writeMdb(configResult, "VMC INITIALIZATION COMMAND (CONFIGURATION)");
-
-    initializationSequenceDone = true;
-    log("VMC INITIALIZATION COMPLETED", { source });
-
-    if (recoveryMode) {
-      // Recovery only restores AUTO_PURCHASE once the VMC has proven it is
-      // talking to us again (or the compatibility fallback expires).
-      evaluateCashlessReady();
-    } else {
-      // Boot keeps the original startup behavior/timing.
-      completeInitialization("startup initialization sequence completed");
-    }
-  }, INIT_STEP_DELAY_MS);
-};
-
-const startRecovery = (reason) => {
-  log("VMC RECOVERY STARTED", { reason });
-
-  recoveryMode = true;
+  if (handshakeExhausted) {
+    log("VMC INITIALIZATION: Not started (handshake attempts exhausted)", reason);
+    return;
+  }
 
   cancelObsoleteTimers();
   clearTransactionState();
-  setVmcStatus("init");
 
-  startInitialization("recovery");
+  initializationInProgress = true;
+  recoveryMode = isRecovery;
+  vmcError = false;
+  handshakeStep = "waiting for READER ENABLE (0x14 0x01 / '140115')";
+
+  if (isRecovery) {
+    log("VMC RECOVERY STARTED", { reason });
+  }
+
+  log("VMC INITIALIZATION STARTED", { reason });
+
+  handshakeTimer = setTimeout(() => {
+    handshakeTimer = null;
+    failHandshake(`no READER ENABLE (140115) within ${HANDSHAKE_TIMEOUT_MS / 1000}s`);
+  }, HANDSHAKE_TIMEOUT_MS);
 };
 
-const markValidVmcResponse = (hex) => {
-  initValidResponseReceived = true;
-  initEvidenceHex = hex;
-  evaluateCashlessReady();
+const completeHandshake = (frameInfo) => {
+  if (handshakeTimer) {
+    clearTimeout(handshakeTimer);
+    handshakeTimer = null;
+  }
+
+  initializationInProgress = false;
+  vmcError = false;
+  handshakeExhausted = false;
+  consecutiveHandshakeFailures = 0;
+  handshakeStep = "complete (READER ENABLE 140115)";
+
+  log("VMC INITIALIZATION COMPLETED", {
+    evidence: frameInfo.hex,
+    interpretation: frameInfo.interpretation,
+  });
+  log("VMC CASHLESS READY", {
+    evidence: "READER ENABLE (140115) received - documented Pi2MDB/MDB handshake complete",
+    lastReceivedFrame,
+  });
+
+  if (recoveryMode) {
+    recoveryMode = false;
+    log("VMC RECOVERY COMPLETED", {
+      outcome: "success",
+      evidence: frameInfo.hex,
+    });
+  }
+
+  // Restore the enabled state; this re-arms the existing AUTO_PURCHASE behavior
+  setVmcStatus("enable");
 };
 
 const handleVmcReset = (frameInfo) => {
+  noteLastFrame(frameInfo);
+
   log("VMC RESET DETECTED", {
     hex: frameInfo.hex,
     interpretation: frameInfo.interpretation,
@@ -589,17 +622,23 @@ const handleVmcReset = (frameInfo) => {
     status: vmcStatus,
   });
 
+  // Documented MDB response to RESET: JUST RESET (00 00). It makes the VMC
+  // read the adapter's config data again and re-run its initialization.
+  writeMdb(checksum([0x00]), "VMC INITIALIZATION COMMAND (JUST RESET)");
+
   if (initializationInProgress) {
     log(
-      "VMC RESET DETECTED: Ignored (initialization/recovery already in progress - no overlapping sequences)",
+      "VMC RESET DETECTED: already waiting for READER ENABLE (140115) - no overlapping sequence started",
     );
     return;
   }
 
-  startRecovery(`VMC reset cashless device 1 (${frameInfo.hex})`);
+  beginHandshake(`VMC reset cashless device 1 (${frameInfo.hex})`, true);
 };
 
-const handleVmcInitializationMessage = (frameInfo) => {
+const handleVmcInitializationMessage = (frameInfo, frameBytes) => {
+  noteLastFrame(frameInfo);
+
   log("VMC INITIALIZATION RESPONSE", {
     hex: frameInfo.hex,
     interpretation: frameInfo.interpretation,
@@ -607,14 +646,22 @@ const handleVmcInitializationMessage = (frameInfo) => {
     status: vmcStatus,
   });
 
-  if (!frameInfo.incomplete && frameInfo.checksumOk) {
-    markValidVmcResponse(frameInfo.hex);
+  // The Pi2MDB adapter answers POLL and the SETUP/config exchange by itself
+  // ("You don't need to do anythings"). SETUP/POLL/EXPANSION/READER frames are
+  // informational only and must not provoke host responses.
+
+  if (frameBytes[0] === 0x14 && frameBytes[1] === 0x01) {
+    // "If you can get the data 140115, Then ... successfully connected to VMC"
+    if (!initializationInProgress) {
+      beginHandshake(`VMC READER ENABLE (${frameInfo.hex})`, false);
+    }
+    completeHandshake(frameInfo);
     return;
   }
 
-  log(
-    "VMC INITIALIZATION RESPONSE: Not counted as ready evidence (frame incomplete or checksum mismatch) - no response sent (the HAT protocol defines none for this frame)",
-  );
+  if (!initializationInProgress && !handshakeExhausted) {
+    beginHandshake(`VMC initialization command ${frameInfo.hex}`, false);
+  }
 };
 
 // ============================================================
@@ -647,7 +694,8 @@ const processVmcData = async (vmcChar, rawHex = null) => {
       return;
     }
 
-    // VMC initialization / management commands (SETUP/POLL/READER/EXPANSION)
+    // VMC initialization commands (SETUP/POLL/READER/EXPANSION) - the Pi2MDB
+    // adapter owns those exchanges; the host only logs/tracks them.
     if (
       frameBytes.length >= 2 &&
       (command === 0x11 ||
@@ -655,13 +703,24 @@ const processVmcData = async (vmcChar, rawHex = null) => {
         command === 0x14 ||
         command === 0x17)
     ) {
-      handleVmcInitializationMessage(describeMdbFrame(frameBytes, payload));
+      handleVmcInitializationMessage(
+        describeMdbFrame(frameBytes, payload),
+        frameBytes,
+      );
       return;
     }
 
-    // ACK (0x00) and VEND traffic (0x13) keep the existing handling below
-    if (command === 0x00 || command === 0x13) {
-      markValidVmcResponse(payload.toUpperCase());
+    // ACK (0x00) and VEND traffic (0x13) keep the existing handling below.
+    // A bare 00 is only the adapter's serial ACK of our last TX - it is never
+    // readiness evidence and must not advance the initialization state.
+    if (command === 0x00) {
+      if (initializationInProgress) {
+        log(
+          "VMC INITIALIZATION RESPONSE: adapter ACK (0x00) - frame acknowledgement only, not readiness evidence",
+        );
+      }
+    } else if (command === 0x13) {
+      lastReceivedFrame = `${payload.toUpperCase()} (VMC VEND/transaction frame)`;
     } else if (frameBytes.length >= 2) {
       // Unknown frames must never change state and must never provoke an
       // ACK/RESET/CASH ON/purchase response.
@@ -1150,13 +1209,23 @@ serialPort.on("close", () => {
 // Initial VMC Configuration
 // ============================================================
 //
-// Same sequence as before: RESET after 5s, CONFIGURATION 3s later, then the
-// AUTO_PURCHASE kick (see completeInitialization). Also reused by reset
-// recovery so both paths initialize the cashless device identically.
+// The Pi2MDB adapter reports the config data saved in its memory to the VMC.
+// This boot sequence keeps the existing behavior (JUST RESET + CONFIG DATA
+// write at 5s/8s) but declares nothing ready: AUTO_PURCHASE starts only after
+// "VMC CASHLESS READY", i.e. after the documented READER ENABLE (140115).
+
+beginHandshake("startup", false);
 
 setTimeout(() => {
-  startInitialization("startup");
+  writeMdb(checksum([0x00]), "VMC INITIALIZATION COMMAND (JUST RESET)");
 }, 5000);
+
+setTimeout(() => {
+  writeMdb(
+    checksum([0x01, 0x03, 0x15, 0x86, 0x01, 0x00, 0x05, 0x0c]),
+    "VMC INITIALIZATION COMMAND (CONFIG DATA)",
+  );
+}, 8000);
 
 // ============================================================
 // Socket.IO - Python Communication
@@ -1195,6 +1264,11 @@ io.on("connection", (socket) => {
   // ----------------------------------------------------------
 
   socket.on("purchase now", () => {
+    if (initializationInProgress || vmcError) {
+      log("PURCHASE BLOCKED: initialization/error state");
+      return;
+    }
+
     log("PYTHON -> VMC: Purchase requested");
 
     setVmcStatus("connect");
@@ -1209,6 +1283,11 @@ io.on("connection", (socket) => {
   // ----------------------------------------------------------
 
   socket.on("start purchase", () => {
+    if (initializationInProgress || vmcError) {
+      log("PURCHASE BLOCKED: initialization/error state");
+      return;
+    }
+
     if (vmcStatus !== "" && vmcStatus !== "enable") {
       log(`PURCHASE BLOCKED: vmcStatus="${vmcStatus}"`);
       return;
